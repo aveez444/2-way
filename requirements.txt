@@ -1,0 +1,6 @@
+flask>=2.3.0
+websockets>=11.0.0
+boto3>=1.28.0
+twilio>=8.0.0
+google-generativeai>=0.3.0
+soundfile>=0.12.0
