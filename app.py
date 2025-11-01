@@ -5,7 +5,7 @@ import base64
 import boto3
 import websockets
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Start, Stream
+from twilio.twiml.voice_response import VoiceResponse, Start
 
 # ------------------ Configuration ------------------
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
@@ -17,26 +17,21 @@ app = Flask(__name__)
 # ------------------ Twilio /voice endpoint ------------------
 @app.route("/voice", methods=["POST"])
 def voice():
-    """TwiML that tells Twilio to start streaming audio to our WebSocket"""
+    """Return TwiML that instructs Twilio to start streaming audio"""
     response = VoiceResponse()
     start = Start()
-    start.stream(url="wss://YOUR_DOMAIN/media")  # <-- replace with your deployed domain (Render WSS)
+    # Twilio Media Stream connects to /media websocket endpoint
+    # (Render uses same domain, so only change to wss://your-domain/media)
+    domain = os.getenv("RENDER_EXTERNAL_URL", "https://localhost")
+    ws_url = domain.replace("https://", "wss://") + "/media"
+    start.stream(url=ws_url)
     response.append(start)
     response.say("Hello! You are connected to the UniCall AI system. You can start speaking now.")
     return Response(str(response), mimetype="text/xml")
 
 # ------------------ AWS Transcribe Streaming setup ------------------
 async def transcribe_stream(audio_queue):
-    """Send audio chunks to AWS Transcribe Streaming and print transcription results"""
-    session = boto3.Session(
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=AWS_REGION,
-    )
-    transcribe_client = session.client("transcribe", region_name=AWS_REGION, use_ssl=True)
-
-    # Use low-level streaming via WebSocket connection
-    # We’ll use aiobotocore or boto3-stubs in later upgrade. For now, print queue audio length.
+    """(placeholder) send audio chunks to AWS Transcribe Streaming"""
     while True:
         audio_chunk = await audio_queue.get()
         if audio_chunk is None:
@@ -45,10 +40,7 @@ async def transcribe_stream(audio_queue):
     print("Stream ended.")
 
 # ------------------ WebSocket handler for Twilio /media ------------------
-connected_clients = set()
-
 async def handle_twilio_media(websocket):
-    """Handles bi-directional Twilio Media Stream"""
     print("[Client connected to /media stream]")
     audio_queue = asyncio.Queue()
     consumer_task = asyncio.create_task(transcribe_stream(audio_queue))
@@ -58,7 +50,6 @@ async def handle_twilio_media(websocket):
             data = json.loads(message)
             event = data.get("event")
 
-            # When Twilio sends audio chunks
             if event == "media":
                 payload = data["media"]["payload"]
                 audio = base64.b64decode(payload)
@@ -79,20 +70,18 @@ async def handle_twilio_media(websocket):
         await consumer_task
         print("[Client disconnected from /media]")
 
-# ------------------ WebSocket server start ------------------
-async def media_ws_server():
-    """Start WebSocket server for Twilio media streams"""
-    port = int(os.getenv("MEDIA_PORT", 4000))
-    print(f"🛰️  Starting WebSocket server on ws://0.0.0.0:{port}/media")
+# ------------------ Run Flask + WebSocket together on one port ------------------
+async def main():
+    port = int(os.getenv("PORT", 10000))  # Render provides PORT dynamically
+    print(f"🚀 Starting on port {port}")
     async with websockets.serve(handle_twilio_media, "0.0.0.0", port, ping_interval=None):
+        # Run Flask in a thread inside same process
+        import threading
+        def run_flask():
+            app.run(host="0.0.0.0", port=port)
+        threading.Thread(target=run_flask, daemon=True).start()
+
         await asyncio.Future()  # run forever
 
-# ------------------ Run Flask + WebSocket concurrently ------------------
 if __name__ == "__main__":
-    import threading
-
-    def run_flask():
-        app.run(host="0.0.0.0", port=5000, debug=True)
-
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(media_ws_server())
+    asyncio.run(main())
