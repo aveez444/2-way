@@ -1,45 +1,33 @@
-import os
-import json
-import asyncio
-import base64
-import boto3
-import websockets
+import os, json, asyncio, base64, boto3, websockets
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Start
 
-# ------------------ Configuration ------------------
+# ---------- CONFIG ----------
 AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 app = Flask(__name__)
 
-# Store active WebSocket connections
-active_connections = set()
-
-# ------------------ Twilio /voice endpoint ------------------
+# ---------- FLASK: Twilio /voice ----------
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Return TwiML that instructs Twilio to start streaming audio"""
-    response = VoiceResponse()
+    """Return TwiML telling Twilio to open a media stream"""
+    resp = VoiceResponse()
     start = Start()
     domain = os.getenv("RENDER_EXTERNAL_URL", "https://localhost")
-    # Use the same domain and path for WebSocket
     ws_url = domain.replace("https://", "wss://") + "/media"
     start.stream(url=ws_url)
-    response.append(start)
-    response.say("Hello! You are connected to the UniCall AI system. You can start speaking now.")
-    return Response(str(response), mimetype="text/xml")
+    resp.append(start)
+    resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
+    return Response(str(resp), mimetype="text/xml")
 
-# Health check endpoint (required by Render)
-@app.route("/", methods=["GET"])
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
+@app.route("/")
+def home():
+    return "UniCall AI running!", 200
 
-# ------------------ AWS Transcribe Streaming setup ------------------
+# ---------- PLACEHOLDER: AWS Transcribe Streaming ----------
 async def transcribe_stream(audio_queue):
-    """(placeholder) send audio chunks to AWS Transcribe Streaming"""
     while True:
         audio_chunk = await audio_queue.get()
         if audio_chunk is None:
@@ -47,17 +35,13 @@ async def transcribe_stream(audio_queue):
         print(f"[Audio chunk received: {len(audio_chunk)} bytes]")
     print("Stream ended.")
 
-# ------------------ WebSocket handler for Twilio /media ------------------
+# ---------- WEBSOCKET HANDLER ----------
 async def handle_twilio_media(websocket, path):
-    """Handle WebSocket connections at /media path"""
-    print(f"[Client connected to /media stream] Path: {path}")
-    
-    # Only handle /media path
     if path != "/media":
-        await websocket.close(1003, "Invalid path")
+        await websocket.close(code=1003, reason="Invalid path")
         return
-        
-    active_connections.add(websocket)
+
+    print(f"[Client connected: {path}]")
     audio_queue = asyncio.Queue()
     consumer_task = asyncio.create_task(transcribe_stream(audio_queue))
 
@@ -65,73 +49,38 @@ async def handle_twilio_media(websocket, path):
         async for message in websocket:
             data = json.loads(message)
             event = data.get("event")
-
             if event == "media":
-                payload = data["media"]["payload"]
-                audio = base64.b64decode(payload)
+                audio = base64.b64decode(data["media"]["payload"])
                 await audio_queue.put(audio)
-
             elif event == "start":
                 print(f"[Stream started] Call SID: {data['start']['callSid']}")
-
             elif event == "stop":
                 print("[Stream stopped]")
                 break
-
-    except websockets.exceptions.ConnectionClosed:
-        print("[WebSocket connection closed]")
     except Exception as e:
-        print(f"[Error in media handler]: {e}")
+        print("WebSocket error:", e)
     finally:
-        active_connections.discard(websocket)
         await audio_queue.put(None)
         await consumer_task
-        print("[Client disconnected from /media]")
+        print("[Client disconnected]")
 
-# ------------------ Combined Server Setup ------------------
-def start_websocket_server():
-    """Start WebSocket server in a separate thread"""
-    port = int(os.getenv("PORT", 10000))
-    
-    async def server_main():
-        print(f"🔌 Starting WebSocket server on port {port}")
-        async with websockets.serve(
-            handle_twilio_media, 
-            "0.0.0.0", 
-            port, 
-            ping_interval=None,
-            # Important for Render compatibility
-            process_request=process_request
-        ):
-            await asyncio.Future()  # run forever
-    
-    # Run WebSocket server in current event loop
-    asyncio.create_task(server_main())
-
-async def process_request(path, request_headers):
-    """Handle HTTP requests that come to WebSocket server"""
-    if path == "/health" or path == "/":
-        return (200, [], b"OK")
-    return None
-
-def run_flask():
-    """Run Flask app - but don't actually start the server"""
-    # Flask will be run by Render's built-in server
-    pass
-
+# ---------- SINGLE PORT SERVER ----------
 async def main():
-    """Main async function"""
     port = int(os.getenv("PORT", 10000))
-    print(f"🚀 Starting combined server on port {port}")
-    
-    # Start WebSocket server
-    start_websocket_server()
-    
-    # Keep the event loop running
-    await asyncio.Future()
+    print(f"🚀 Flask + WebSocket running on port {port}")
 
-# For Render deployment, we need to use their startup process
+    # Run Flask in a background thread
+    import threading
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, threaded=True), daemon=True).start()
+
+    # Start WebSocket on same port
+    async with websockets.serve(
+        handle_twilio_media,
+        host="0.0.0.0",
+        port=port,
+        ping_interval=None,
+    ):
+        await asyncio.Future()  # keep running
+
 if __name__ == "__main__":
-    # This will only run locally
     asyncio.run(main())
-    
