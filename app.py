@@ -64,23 +64,24 @@ async def handle_twilio_media(websocket, path):
         await consumer_task
         print("[Client disconnected]")
 
-# ---------- SINGLE PORT SERVER ----------
+# ---------- COMBINED SERVER ----------
 async def main():
-    port = int(os.getenv("PORT", 10000))
-    print(f"🚀 Flask + WebSocket running on port {port}")
+    http_port = int(os.getenv("PORT", 10000))
+    ws_port = 8765  # Internal websocket server port
 
-    # Run Flask in a background thread
+    print(f"🚀 Flask HTTP on port {http_port}")
+    print(f"🔌 WebSocket listening internally on {ws_port}")
+
     import threading
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, threaded=True), daemon=True).start()
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=http_port, threaded=True), daemon=True).start()
 
-    # Start WebSocket on same port
     async with websockets.serve(
         handle_twilio_media,
         host="0.0.0.0",
-        port=port,
+        port=ws_port,
         ping_interval=None,
     ):
-        await asyncio.Future()  # keep running
+        await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
     asyncio.run(main())
