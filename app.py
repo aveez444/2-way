@@ -71,16 +71,22 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
                 continue
             if result.alternatives:
                 text = result.alternatives[0].transcript.strip()
-                await self.output_queue.put(text)
+                if text:
+                    print("AWS Transcript:", text)
+                    await self.output_queue.put(text)
 
 async def aws_transcribe_stream(audio_queue, transcript_queue):
     """Send audio to AWS Transcribe and push transcripts into transcript_queue."""
-    client = TranscribeStreamingClient(region=AWS_REGION)
-    async with client.start_stream_transcription(
+    client = TranscribeStreamingClient(region=os.getenv("AWS_REGION", "us-east-1"))
+
+    # 👇 FIXED LINE HERE
+    stream = await client.start_stream_transcription(
         language_code="en-US",
         media_sample_rate_hz=8000,
         media_encoding="pcm",
-    ) as stream:
+    )
+
+    async with stream:
         handler = MyTranscriptHandler(stream.output_stream, transcript_queue)
 
         async def send_audio():
@@ -92,6 +98,7 @@ async def aws_transcribe_stream(audio_queue, transcript_queue):
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
 
         await asyncio.gather(send_audio(), handler.handle_events())
+
 
 
 # ---------- LLM (Gemini) ----------
