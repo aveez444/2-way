@@ -1,16 +1,26 @@
-import os, json, asyncio, base64, boto3
+import os, json, asyncio, base64, requests
 from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse, Start
 from twilio.rest import Client
+import google.generativeai as genai
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
 # ---------- CONFIG ----------
-AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")  # us-east-1 supports Transcribe
+ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "H8bdWZHK2OgZwTN7ponr")
+GEN_API_KEY = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=GEN_API_KEY)
+
+SYSTEM_PROMPT = """
+You are UniCall AI — a polite, knowledgeable virtual agent for Galaxy Auto Products.
+Keep your answers short, natural, and helpful.
+"""
 
 app = Quart(__name__)
 
-# ---------- ROUTE: Trigger outbound call ----------
+# ---------- Twilio outbound call trigger ----------
 @app.post("/trigger-call")
 async def trigger_call():
     data = await request.get_json()
@@ -18,32 +28,24 @@ async def trigger_call():
     if not to_number:
         return {"error": "Missing 'to' number"}, 400
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_PHONE_NUMBER")
-    domain = os.getenv("RENDER_EXTERNAL_URL")
-
-    if not all([account_sid, auth_token, from_number, domain]):
-        return {"error": "Twilio environment variables not set"}, 500
-
-    client = Client(account_sid, auth_token)
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN"),
+    )
     call = client.calls.create(
         to=to_number,
-        from_=from_number,
-        url=f"{domain}/voice"  # Twilio will fetch this TwiML
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
+        url=f"{os.getenv('RENDER_EXTERNAL_URL')}/voice"
     )
-
     return {"status": "calling", "sid": call.sid}, 200
 
 
-# ---------- ROUTE: Twilio /voice ----------
+# ---------- Twilio voice webhook ----------
 @app.post("/voice")
 async def voice():
-    """Twilio webhook to start media stream"""
     resp = VoiceResponse()
     start = Start()
-    domain = os.getenv("RENDER_EXTERNAL_URL", "https://localhost")
-    ws_url = domain.replace("https://", "wss://") + "/media"
+    ws_url = os.getenv("RENDER_EXTERNAL_URL").replace("https://", "wss://") + "/media"
     start.stream(url=ws_url)
     resp.append(start)
     resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
@@ -52,52 +54,104 @@ async def voice():
 
 @app.get("/")
 async def home():
-    return "🚀 UniCall AI is running!", 200
+    return "🚀 UniCall AI with Live AI Voice is running!", 200
 
 
-# ---------- ASYNC TASK: AWS Transcribe placeholder ----------
-async def transcribe_stream(audio_queue: asyncio.Queue):
-    """Simulates processing of audio stream."""
-    while True:
-        audio_chunk = await audio_queue.get()
-        if audio_chunk is None:
-            break
-        print(f"[Audio chunk received: {len(audio_chunk)} bytes]")
-    print("Stream ended.")
+# ---------- AWS Transcribe Streaming ----------
+from amazon_transcribe.model import AudioEvent
+
+class MyTranscriptHandler(TranscriptResultStreamHandler):
+    def __init__(self, stream, output_queue):
+        super().__init__(stream)
+        self.output_queue = output_queue
+
+    async def handle_transcript_event(self, transcript_event):
+        for result in transcript_event.transcript.results:
+            if result.is_partial:
+                continue
+            if result.alternatives:
+                text = result.alternatives[0].transcript.strip()
+                await self.output_queue.put(text)
+
+async def aws_transcribe_stream(audio_queue, transcript_queue):
+    """Send audio to AWS Transcribe and push transcripts into transcript_queue."""
+    client = TranscribeStreamingClient(region=AWS_REGION)
+    async with client.start_stream_transcription(
+        language_code="en-US",
+        media_sample_rate_hz=8000,
+        media_encoding="pcm",
+    ) as stream:
+        handler = MyTranscriptHandler(stream.output_stream, transcript_queue)
+
+        async def send_audio():
+            while True:
+                chunk = await audio_queue.get()
+                if chunk is None:
+                    await stream.input_stream.end_stream()
+                    break
+                await stream.input_stream.send_audio_event(audio_chunk=chunk)
+
+        await asyncio.gather(send_audio(), handler.handle_events())
 
 
-# ---------- WEBSOCKET HANDLER ----------
+# ---------- LLM (Gemini) ----------
+async def ask_ai(prompt: str) -> str:
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content([SYSTEM_PROMPT, prompt])
+    return response.text.strip() if response else "I'm not sure how to respond."
+
+
+# ---------- ElevenLabs TTS ----------
+async def synthesize_speech(text: str) -> bytes:
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {"text": text,
+               "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}}
+    r = requests.post(url, headers=headers, json=payload)
+    return r.content
+
+
+# ---------- WebSocket handler ----------
 @app.websocket("/media")
 async def handle_twilio_media():
-    print("[Twilio WebSocket connected]")
+    print("[Twilio connected]")
     audio_queue = asyncio.Queue()
-    consumer_task = asyncio.create_task(transcribe_stream(audio_queue))
+    transcript_queue = asyncio.Queue()
 
-    try:
-        async for message in websocket:
-            data = json.loads(message)
-            event = data.get("event")
+    transcribe_task = asyncio.create_task(
+        aws_transcribe_stream(audio_queue, transcript_queue)
+    )
 
-            if event == "media":
-                audio = base64.b64decode(data["media"]["payload"])
-                await audio_queue.put(audio)
-
-            elif event == "start":
-                print(f"[Stream started] Call SID: {data['start']['callSid']}")
-
-            elif event == "stop":
-                print("[Stream stopped]")
+    async def consume_ws():
+        async for msg in websocket:
+            data = json.loads(msg)
+            if data.get("event") == "media":
+                raw = base64.b64decode(data["media"]["payload"])
+                await audio_queue.put(raw)
+            elif data.get("event") == "stop":
+                await audio_queue.put(None)
+                await transcript_queue.put(None)
                 break
 
-    except Exception as e:
-        print("❌ WebSocket error:", e)
-    finally:
-        await audio_queue.put(None)
-        await consumer_task
-        print("[Twilio WebSocket disconnected]")
+    async def consume_transcripts():
+        while True:
+            text = await transcript_queue.get()
+            if text is None:
+                break
+            print("Caller:", text)
+            ai_reply = await ask_ai(text)
+            print("AI:", ai_reply)
+            speech = await synthesize_speech(ai_reply)
+            # In real use, encode and stream this audio back to Twilio if desired
+
+    await asyncio.gather(consume_ws(), consume_transcripts(), transcribe_task)
+    print("[Twilio disconnected]")
 
 
-# ---------- ENTRY POINT ----------
+# ---------- Entry ----------
 if __name__ == "__main__":
     import hypercorn.asyncio
     from hypercorn.config import Config
@@ -105,6 +159,5 @@ if __name__ == "__main__":
     config = Config()
     config.bind = [f"0.0.0.0:{os.getenv('PORT', '10000')}"]
     config.use_reloader = False
-
-    print("🚀 Starting UniCall AI (Quart + Hypercorn)")
+    print("🚀 Starting UniCall AI with full streaming pipeline...")
     asyncio.run(hypercorn.asyncio.serve(app, config))
