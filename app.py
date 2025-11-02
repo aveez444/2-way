@@ -125,7 +125,7 @@ async def synthesize_speech(text: str) -> bytes:
 @app.websocket("/media")
 async def handle_twilio_media():
     print("[Twilio connected]")
-    ws = websocket._get_current_object()  # 👈 Fix: get real websocket object
+    ws = websocket._get_current_object()  # get the actual websocket
 
     audio_queue = asyncio.Queue()
     transcript_queue = asyncio.Queue()
@@ -135,7 +135,10 @@ async def handle_twilio_media():
     )
 
     async def consume_ws():
-        async for msg in ws:  # 👈 Use 'ws' instead of 'websocket'
+        while True:
+            msg = await ws.receive()
+            if msg is None:
+                break
             data = json.loads(msg)
             if data.get("event") == "media":
                 raw = base64.b64decode(data["media"]["payload"])
@@ -154,12 +157,10 @@ async def handle_twilio_media():
             ai_reply = await ask_ai(text)
             print("AI:", ai_reply)
             speech = await synthesize_speech(ai_reply)
-            # Optionally stream TTS back to Twilio here
+            # Optionally: stream speech back to Twilio
 
     await asyncio.gather(consume_ws(), consume_transcripts(), transcribe_task)
     print("[Twilio disconnected]")
-
-
 
 # ---------- Entry ----------
 if __name__ == "__main__":
