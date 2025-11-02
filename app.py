@@ -82,3 +82,30 @@ if __name__ == "__main__":
     print("🚀 Starting UniCall AI (Quart + Hypercorn)")
 
     asyncio.run(hypercorn.asyncio.serve(app, config))
+
+
+from twilio.rest import Client
+
+@app.post("/trigger-call")
+async def trigger_call():
+    data = await request.get_json()
+    to_number = data.get("to")
+    if not to_number:
+        return {"error": "Missing 'to' number"}, 400
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+    domain = os.getenv("RENDER_EXTERNAL_URL")
+
+    if not all([account_sid, auth_token, from_number, domain]):
+        return {"error": "Twilio environment vars not set"}, 500
+
+    client = Client(account_sid, auth_token)
+    call = client.calls.create(
+        to=to_number,
+        from_=from_number,
+        url=f"{domain}/voice"  # Twilio will fetch this TwiML
+    )
+
+    return {"status": "calling", "sid": call.sid}, 200
