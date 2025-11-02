@@ -1,5 +1,5 @@
-import os, json, asyncio, base64, boto3, websockets
-from flask import Flask, request, Response
+import os, json, asyncio, base64, boto3
+from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse, Start
 
 # ---------- CONFIG ----------
@@ -7,12 +7,12 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-north-1")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-app = Flask(__name__)
+app = Quart(__name__)
 
-# ---------- FLASK: Twilio /voice ----------
-@app.route("/voice", methods=["POST"])
-def voice():
-    """Return TwiML telling Twilio to open a media stream"""
+# ---------- ROUTE: Twilio /voice ----------
+@app.post("/voice")
+async def voice():
+    """Twilio webhook to start media stream"""
     resp = VoiceResponse()
     start = Start()
     domain = os.getenv("RENDER_EXTERNAL_URL", "https://localhost")
@@ -20,14 +20,17 @@ def voice():
     start.stream(url=ws_url)
     resp.append(start)
     resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
-    return Response(str(resp), mimetype="text/xml")
+    return str(resp), 200, {"Content-Type": "text/xml"}
 
-@app.route("/")
-def home():
-    return "UniCall AI running!", 200
 
-# ---------- PLACEHOLDER: AWS Transcribe Streaming ----------
-async def transcribe_stream(audio_queue):
+@app.get("/")
+async def home():
+    return "🚀 UniCall AI is running!", 200
+
+
+# ---------- ASYNC TASK: AWS Transcribe placeholder ----------
+async def transcribe_stream(audio_queue: asyncio.Queue):
+    """Simulates processing of audio stream."""
     while True:
         audio_chunk = await audio_queue.get()
         if audio_chunk is None:
@@ -35,13 +38,11 @@ async def transcribe_stream(audio_queue):
         print(f"[Audio chunk received: {len(audio_chunk)} bytes]")
     print("Stream ended.")
 
-# ---------- WEBSOCKET HANDLER ----------
-async def handle_twilio_media(websocket, path):
-    if path != "/media":
-        await websocket.close(code=1003, reason="Invalid path")
-        return
 
-    print(f"[Client connected: {path}]")
+# ---------- WEBSOCKET HANDLER ----------
+@app.websocket("/media")
+async def handle_twilio_media():
+    print("[Twilio WebSocket connected]")
     audio_queue = asyncio.Queue()
     consumer_task = asyncio.create_task(transcribe_stream(audio_queue))
 
@@ -49,39 +50,35 @@ async def handle_twilio_media(websocket, path):
         async for message in websocket:
             data = json.loads(message)
             event = data.get("event")
+
             if event == "media":
                 audio = base64.b64decode(data["media"]["payload"])
                 await audio_queue.put(audio)
+
             elif event == "start":
                 print(f"[Stream started] Call SID: {data['start']['callSid']}")
+
             elif event == "stop":
                 print("[Stream stopped]")
                 break
+
     except Exception as e:
-        print("WebSocket error:", e)
+        print("❌ WebSocket error:", e)
     finally:
         await audio_queue.put(None)
         await consumer_task
-        print("[Client disconnected]")
+        print("[Twilio WebSocket disconnected]")
 
-# ---------- COMBINED SERVER ----------
-async def main():
-    http_port = int(os.getenv("PORT", 10000))
-    ws_port = 8765  # Internal websocket server port
 
-    print(f"🚀 Flask HTTP on port {http_port}")
-    print(f"🔌 WebSocket listening internally on {ws_port}")
-
-    import threading
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=http_port, threaded=True), daemon=True).start()
-
-    async with websockets.serve(
-        handle_twilio_media,
-        host="0.0.0.0",
-        port=ws_port,
-        ping_interval=None,
-    ):
-        await asyncio.Future()  # run forever
-
+# ---------- ENTRY POINT ----------
 if __name__ == "__main__":
-    asyncio.run(main())
+    import hypercorn.asyncio
+    from hypercorn.config import Config
+
+    config = Config()
+    config.bind = [f"0.0.0.0:{os.getenv('PORT', '10000')}"]
+    config.use_reloader = False  # Avoid double startup on Render
+
+    print("🚀 Starting UniCall AI (Quart + Hypercorn)")
+
+    asyncio.run(hypercorn.asyncio.serve(app, config))
